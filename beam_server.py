@@ -54,7 +54,7 @@ def init_llm():
     on_start=init_llm,  # выполняется один раз при поднятии контейнера, результат кешируется
     keep_warm_seconds=90,  # держим контейнер тёплым 90с после последнего запроса
 )
-def handler(context):
+def qwen36(context):
     from fastapi import FastAPI, Request
     from fastapi.middleware.cors import CORSMiddleware
     from vllm import SamplingParams
