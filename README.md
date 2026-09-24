@@ -4,7 +4,7 @@ Self-hosted open-weight LLM уровня Gemini 3.6 Flash, свой контей
 
 | | |
 |---|---|
-| Модель | Qwen3.6-27B-Instruct-AWQ |
+| Модель | Qwen3.6-27B (community AWQ-квант, `QuantTrio/Qwen3.6-27B-AWQ`) |
 | Стоимость | $0 (recurring $30/мес free credits) |
 | Карта | не нужна |
 | Телефон | не нужен |
@@ -29,10 +29,14 @@ https://<ваш-юзер>--qwen36-27b-generate.modal.run
 ## Обращение к модели
 
 ```bash
-curl -X POST https://<ваш-юзер>--qwen36-27b-generate.modal.run \
+curl -X POST https://<ваш-юзер>--qwen36-27b-model-generate.modal.run \
   -H "Content-Type: application/json" \
   -d '{"text": "Объясни разницу между MoE и dense моделями", "max_tokens": 400}'
 ```
+
+## Чат-интерфейс
+
+`chat.html` — минималистичная веб-страница: вставьте свой Modal URL в поле сверху и общайтесь с моделью из браузера. Откройте файл локально или разместите на любом статик-хостинге. Endpoint запоминается в `localStorage` браузера.
 
 ## Регистрация на Modal — как снизить риск верификации
 
