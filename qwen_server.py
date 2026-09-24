@@ -30,7 +30,7 @@ def download_weights():
 
 image = (
     modal.Image.debian_slim()
-    .pip_install("vllm==0.9.0", "huggingface_hub[hf_transfer,hf_xet]")
+    .pip_install("vllm==0.9.0", "huggingface_hub[hf_transfer,hf_xet]", "fastapi[standard]")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_XET_HIGH_PERFORMANCE": "1"})
     .run_function(download_weights)  # веса запекаются в image-слой при сборке
 )
@@ -63,7 +63,7 @@ class Model:
             enforce_eager=True,  # совместимость с GPU snapshot (CUDA graphs могут его ломать)
         )
 
-    @modal.web_endpoint(method="POST")
+    @modal.fastapi_endpoint(method="POST")
     def generate(self, prompt: dict):
         from vllm import SamplingParams
 
