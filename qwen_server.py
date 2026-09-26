@@ -28,10 +28,20 @@ image = (
 
 MODEL_PATH = "/model"
 
-# ТОП СКОРОСТЬ: L40S ощутимо быстрее A10G на 27B-классе (больше tensor cores,
-# выше пропускная способность памяти) при сопоставимом классе цены.
-# Откатитесь на "A10G", если важнее бюджет, а не топ-скорость.
-GPU_TYPE = "L40S"
+# ВАЖНО: L40S/A100/H100 быстрее A10G, но дороже за час -- при вашей нагрузке
+# (~1000 сообщений/день) L40S уже выходит за пределы бесплатных $30/мес
+# Modal (расчёт: ~$32-130/мес против A10G ~$18-73/мес). Приоритет -- не терять
+# большой бесплатный лимит, поэтому GPU зафиксирован на A10G. Дальше -- топ
+# скорость исключительно программными средствами (все бесплатны).
+GPU_TYPE = "A10G"
+
+# max_inputs согласован с max_num_seqs ниже. Если оставить max_inputs=4 (как
+# было раньше), continuous batching движка физически не увидит больше 4
+# конкурентных запросов -- max_num_seqs становится мёртвым параметром.
+# Стартовое значение для A10G 24GB + 27B AWQ (~16-18GB весов) -- дальше
+# смотрите на "# GPU blocks"/"maximum concurrency" в логах запуска vLLM
+# и поднимайте оба числа синхронно, если есть запас по VRAM.
+MAX_NUM_SEQS = 48
 
 
 @app.cls(
@@ -45,7 +55,7 @@ GPU_TYPE = "L40S"
     # уровне @app.cls не появилось.
     experimental_options={"enable_gpu_snapshot": True},
 )
-@modal.concurrent(max_inputs=4)
+@modal.concurrent(max_inputs=MAX_NUM_SEQS)
 class Model:
     @modal.enter()
     async def start_engine(self):
@@ -53,9 +63,6 @@ class Model:
         # token-by-token streaming в vLLM 0.29+. Синхронный класс `LLM`
         # (offline batch API) стриминг не поддерживает вообще -- он
         # возвращает список RequestOutput целиком после полного завершения.
-        # `vllm.AsyncLLMEngine` в текущих версиях -- просто алиас на этот
-        # же класс (V0 AsyncLLMEngine физически удалён), импортируем
-        # напрямую как рекомендует актуальная документация vLLM.
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -66,16 +73,49 @@ class Model:
             gpu_memory_utilization=0.90,
             enable_prefix_caching=True,   # пропускает recompute при повторяющемся system prompt
             enable_chunked_prefill=True,  # снижает TTFT при длинных промптах, не блокирует decode
+            # --- Continuous batching: подобраны под A10G 24GB + 27B AWQ. ---
+            # Смотрите лог старта vLLM ("# GPU blocks", "maximum concurrency")
+            # и поднимайте синхронно с MAX_NUM_SEQS выше, если есть запас VRAM.
+            max_num_seqs=MAX_NUM_SEQS,
+            max_num_batched_tokens=4096,  # компромисс TTFT/throughput при плотной VRAM
+            # --- Quantized KV cache: освобождает VRAM под больший batch. ---
+            # Официально задокументированный эффект: вдвое меньше KV cache ->
+            # либо больше конкурентных запросов, либо длиннее контекст при
+            # той же памяти. Честная оговорка: без scale-калибровки через
+            # llm-compressor возможна лёгкая деградация точности, особенно
+            # на длинных контекстах/математике -- проверьте на своих задачах,
+            # откатите на "auto", если качество ответов заметно просядет.
+            kv_cache_dtype="fp8",
+            # --- CUDA graphs: НЕ отключаем ради снапшота. Устаревшее ---
+            # предположение (eager нужен для совместимости с Modal GPU
+            # snapshot) не подтвердилось: официальный блог Modal прямо
+            # рекомендует делать warmup ДО снапшота именно чтобы CUDA graphs
+            # попали в сохранённое состояние и не пересобирались при cold
+            # start. enforce_eager здесь оставлен по умолчанию (False).
+            compilation_config={"cudagraph_mode": "FULL_AND_PIECEWISE"},
+            # --- Спекулятивное декодирование: n-gram, без риска по VRAM. ---
+            # Draft-модель того же семейства не влезет рядом с уже занятыми
+            # ~16-18GB весов на A10G 24GB -- n-gram не требует второй модели
+            # вообще. Эффективность зависит от повторяемости контента (код,
+            # структурированные ответы -- да; свободная проза -- под
+            # вопросом) -- сравните throughput/TTFT до и после на реальном
+            # трафике, это не гарантированный, а вероятностный выигрыш.
+            speculative_config={
+                "method": "ngram",
+                "num_speculative_tokens": 4,
+                "prompt_lookup_min": 2,
+                "prompt_lookup_max": 5,
+            },
         )
         self.engine = AsyncLLM.from_engine_args(engine_args)
 
-        # Прогрев -- первый реальный запрос после старта контейнера иначе
-        # платит за CUDA graph capture/JIT. Гоняем короткий forward pass
-        # синхронно до того, как контейнер примет трафик.
+        # Explicit warmup ПЕРЕД снапшотом -- без него CUDA graphs/torch.compile
+        # артефакты не попадают в сохранённое состояние, и каждый cold start
+        # платит за их пересборку заново, теряя весь смысл снапшота.
         from vllm import SamplingParams
         from vllm.utils import random_uuid
 
-        warmup_params = SamplingParams(max_tokens=8)
+        warmup_params = SamplingParams(max_tokens=32)
         async for _ in self.engine.generate(
             prompt="ping", sampling_params=warmup_params, request_id=random_uuid()
         ):
