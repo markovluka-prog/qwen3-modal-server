@@ -187,6 +187,24 @@
       let buffer = '';
       let full = '';
 
+      // Батчинг DOM-обновлений через requestAnimationFrame: без этого
+      // pending.textContent обновляется на КАЖДЫЙ SSE-чанк, вызывая
+      // синхронный reflow/layout браузера при каждом токене -- десятки
+      // forced-reflow в секунду на быстрой генерации (особенно заметно со
+      // спекулятивным декодированием на сервере). requestAnimationFrame
+      // схлопывает все обновления между кадрами в одну перерисовку --
+      // максимум 60 обновлений DOM в секунду вместо одного на токен.
+      let rafScheduled = false;
+      function scheduleRender() {
+        if (rafScheduled) return;
+        rafScheduled = true;
+        requestAnimationFrame(() => {
+          pending.textContent = full;
+          chatEl.scrollTop = chatEl.scrollHeight;
+          rafScheduled = false;
+        });
+      }
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -203,14 +221,16 @@
             const { delta } = JSON.parse(payload);
             if (delta) {
               full += delta;
-              pending.textContent = full;
-              chatEl.scrollTop = chatEl.scrollHeight;
+              scheduleRender();
             }
           } catch (e) { /* неполный JSON на границе чанка -- игнорируем */ }
         }
       }
 
-      if (!full) pending.textContent = '(пустой ответ)';
+      // Финальный рендер вне rAF -- гарантирует, что последний кусочек
+      // ответа виден сразу после завершения стрима, не дожидаясь кадра.
+      pending.textContent = full || '(пустой ответ)';
+      chatEl.scrollTop = chatEl.scrollHeight;
     } catch (err) {
       // Типичная причина здесь -- CORS (сервер не прислал
       // Access-Control-Allow-Origin) либо сеть/URL неверен.
