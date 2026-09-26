@@ -17,10 +17,8 @@ def download_weights():
 
 image = (
     modal.Image.debian_slim()
-    # vLLM 0.9.0 устарел более чем на год к сентябрю 2026 и не поддержит Qwen3.6.
-    # Берём актуальную ветку без жёсткого пина на конкретный патч.
     .pip_install(
-        "vllm>=0.29,<0.31",
+        "vllm==0.30.0",  # актуальная стабильная на сентябрь 2026, содержит V1 AsyncLLM
         "huggingface_hub[hf_transfer,hf_xet]",
         "fastapi[standard]",
     )
@@ -30,13 +28,15 @@ image = (
 
 MODEL_PATH = "/model"
 
-# Модель, которую собираем в fetch()-ответ на клиенте
-ALLOWED_ORIGINS = ["*"]  # в проде сузьте до конкретного домена фронтенда
+# ТОП СКОРОСТЬ: L40S ощутимо быстрее A10G на 27B-классе (больше tensor cores,
+# выше пропускная способность памяти) при сопоставимом классе цены.
+# Откатитесь на "A10G", если важнее бюджет, а не топ-скорость.
+GPU_TYPE = "L40S"
 
 
 @app.cls(
     image=image,
-    gpu="A10G",
+    gpu=GPU_TYPE,
     scaledown_window=90,
     timeout=120,
     enable_memory_snapshot=True,
@@ -47,59 +47,106 @@ ALLOWED_ORIGINS = ["*"]  # в проде сузьте до конкретног�
 )
 @modal.concurrent(max_inputs=4)
 class Model:
-    @modal.enter(snap=True)
-    def load(self):
-        from vllm import LLM
+    @modal.enter()
+    async def start_engine(self):
+        # AsyncLLM (V1-движок) -- единственный способ получить настоящий
+        # token-by-token streaming в vLLM 0.29+. Синхронный класс `LLM`
+        # (offline batch API) стриминг не поддерживает вообще -- он
+        # возвращает список RequestOutput целиком после полного завершения.
+        # `vllm.AsyncLLMEngine` в текущих версиях -- просто алиас на этот
+        # же класс (V0 AsyncLLMEngine физически удалён), импортируем
+        # напрямую как рекомендует актуальная документация vLLM.
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.v1.engine.async_llm import AsyncLLM
 
-        self.llm = LLM(
+        engine_args = AsyncEngineArgs(
             model=MODEL_PATH,
             quantization="awq",
             max_model_len=8192,
             gpu_memory_utilization=0.90,
-            max_num_seqs=4,
-            enable_prefix_caching=True,
-            # enforce_eager убран: с GPU-снапшотами имеет смысл снапшотить
-            # уже скомпилированные CUDA-графы, eager-режим только режет
-            # throughput и не нужен для корректности снапшота.
+            enable_prefix_caching=True,   # пропускает recompute при повторяющемся system prompt
+            enable_chunked_prefill=True,  # снижает TTFT при длинных промптах, не блокирует decode
         )
-        # Прогрев форвард-пассом ДО снапшота -- Modal рекомендует переносить
-        # инициализационную работу в фазу snap=True, чтобы она не повторялась
-        # при каждом restore.
-        from vllm import SamplingParams
+        self.engine = AsyncLLM.from_engine_args(engine_args)
 
-        self.llm.generate(["ping"], SamplingParams(max_tokens=1))
+        # Прогрев -- первый реальный запрос после старта контейнера иначе
+        # платит за CUDA graph capture/JIT. Гоняем короткий forward pass
+        # синхронно до того, как контейнер примет трафик.
+        from vllm import SamplingParams
+        from vllm.utils import random_uuid
+
+        warmup_params = SamplingParams(max_tokens=8)
+        async for _ in self.engine.generate(
+            prompt="ping", sampling_params=warmup_params, request_id=random_uuid()
+        ):
+            pass
 
     @modal.method()
-    def _generate(self, prompt: dict) -> dict:
+    async def _generate_once(self, prompt: dict) -> dict:
+        """Нестримящий путь -- используется прогревом по расписанию."""
         from vllm import SamplingParams
+        from vllm.utils import random_uuid
 
-        params = SamplingParams(
-            temperature=0.7, max_tokens=prompt.get("max_tokens", 350)
-        )
-        out = self.llm.generate([prompt["text"]], params)
-        return {"response": out[0].outputs[0].text}
+        params = SamplingParams(temperature=0.7, max_tokens=prompt.get("max_tokens", 350))
+        text = ""
+        async for output in self.engine.generate(
+            prompt=prompt["text"], sampling_params=params, request_id=random_uuid()
+        ):
+            if output.outputs:
+                text = output.outputs[0].text  # без DELTA -- накопленная строка
+        return {"response": text}
 
     @modal.fastapi_endpoint(method="POST")
-    def generate(self, prompt: dict):
-        from fastapi import Response
+    async def generate(self, prompt: dict):
+        from fastapi.responses import StreamingResponse, JSONResponse
+        from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
+        from vllm.utils import random_uuid
         import json
 
-        result = self._generate.local(prompt)
-        # Modal НЕ добавляет CORS-заголовки автоматически -- без них
-        # браузерный fetch() с другого origin будет заблокирован.
-        return Response(
-            content=json.dumps(result),
-            media_type="application/json",
+        stream = prompt.get("stream", True)  # стрим по умолчанию -- это и есть "топ скорость"
+        cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        }
+
+        if not stream:
+            result = await self._generate_once.local(prompt)
+            return JSONResponse(content=result, headers=cors_headers)
+
+        params = SamplingParams(
+            temperature=0.7,
+            max_tokens=prompt.get("max_tokens", 350),
+            output_kind=RequestOutputKind.DELTA,  # только новый кусочек на каждой итерации
+        )
+        request_id = random_uuid()
+
+        async def sse_generator():
+            async for output in self.engine.generate(
+                prompt=prompt["text"], sampling_params=params, request_id=request_id
+            ):
+                for completion in output.outputs:
+                    delta = completion.text
+                    if delta:
+                        yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
+                if output.finished:
+                    break
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            sse_generator(),
+            media_type="text/event-stream",
             headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type",
+                **cors_headers,
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # отключает буферизацию прокси перед клиентом
             },
         )
 
     @modal.fastapi_endpoint(method="OPTIONS")
     def generate_options(self):
-        # Preflight-запрос браузера перед POST с Content-Type: application/json
         from fastapi import Response
 
         return Response(
@@ -114,7 +161,4 @@ class Model:
 
 @app.function(schedule=modal.Cron("0 8,20 * * *"))
 def warmup_ping():
-    # Прогрев дергает бизнес-логику напрямую через @modal.method(),
-    # а не HTTP fastapi_endpoint -- вызов .remote() на fastapi_endpoint
-    # методе не проходит штатный путь ASGI/FastAPI-валидации и ненадёжен.
-    Model()._generate.remote({"text": "ping", "max_tokens": 1})
+    Model()._generate_once.remote({"text": "ping", "max_tokens": 1})

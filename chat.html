@@ -163,14 +163,14 @@
     }
 
     addMessage(text, 'user');
-    const pending = addMessage('...', 'bot');
+    const pending = addMessage('', 'bot');
     sendBtn.disabled = true;
 
     try {
       const resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: text, max_tokens: 350 }),
+        body: JSON.stringify({ text: text, max_tokens: 350, stream: true }),
       });
 
       if (!resp.ok) {
@@ -180,8 +180,37 @@
         return;
       }
 
-      const data = await resp.json();
-      pending.textContent = data.response ?? JSON.stringify(data);
+      // Стриминг SSE: сервер шлёт "data: {...}\n\n" по мере генерации
+      // токенов -- текст появляется сразу, а не после полного ответа.
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let full = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop(); // последний кусок может быть неполным -- оставляем в буфере
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.slice(6);
+          if (payload === '[DONE]') continue;
+          try {
+            const { delta } = JSON.parse(payload);
+            if (delta) {
+              full += delta;
+              pending.textContent = full;
+              chatEl.scrollTop = chatEl.scrollHeight;
+            }
+          } catch (e) { /* неполный JSON на границе чанка -- игнорируем */ }
+        }
+      }
+
+      if (!full) pending.textContent = '(пустой ответ)';
     } catch (err) {
       // Типичная причина здесь -- CORS (сервер не прислал
       // Access-Control-Allow-Origin) либо сеть/URL неверен.
