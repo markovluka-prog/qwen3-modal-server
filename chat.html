@@ -39,7 +39,7 @@
     display: flex;
     gap: 8px;
   }
-  #endpoint-url {
+  #endpoint-url, #auth-token {
     flex: 1;
     background: var(--panel);
     border: 1px solid var(--border);
@@ -118,6 +118,9 @@
     <input id="endpoint-url" type="text"
       placeholder="https://<workspace>--qwen36-27b-model-generate.modal.run"
       value="">
+    <input id="auth-token" type="password"
+      placeholder="Bearer-токен (тот же, что в modal secret create)"
+      value="">
   </div>
 
   <div id="chat"></div>
@@ -134,15 +137,24 @@
   const promptEl = document.getElementById('prompt');
   const sendBtn = document.getElementById('send-btn');
   const endpointEl = document.getElementById('endpoint-url');
+  const tokenEl = document.getElementById('auth-token');
 
   const STORAGE_KEY = 'qwen36_endpoint_url';
+  const TOKEN_STORAGE_KEY = 'qwen36_auth_token';
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) endpointEl.value = saved;
+    const savedToken = localStorage.getItem(TOKEN_STORAGE_KEY);
+    if (savedToken) tokenEl.value = savedToken;
   } catch (e) { /* localStorage недоступен -- просто игнорируем */ }
 
   endpointEl.addEventListener('change', () => {
     try { localStorage.setItem(STORAGE_KEY, endpointEl.value.trim()); }
+    catch (e) { /* private mode / заблокировано -- не критично */ }
+  });
+
+  tokenEl.addEventListener('change', () => {
+    try { localStorage.setItem(TOKEN_STORAGE_KEY, tokenEl.value.trim()); }
     catch (e) { /* private mode / заблокировано -- не критично */ }
   });
 
@@ -157,8 +169,13 @@
 
   async function sendMessage(text) {
     const url = endpointEl.value.trim();
+    const token = tokenEl.value.trim();
     if (!url) {
       addMessage('Укажите URL Modal-эндпоинта выше.', 'err');
+      return;
+    }
+    if (!token) {
+      addMessage('Укажите bearer-токен выше (тот же, что задан через modal secret create).', 'err');
       return;
     }
 
@@ -169,9 +186,18 @@
     try {
       const resp = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + token,
+        },
         body: JSON.stringify({ text: text, max_tokens: 350, stream: true }),
       });
+
+      if (resp.status === 401) {
+        pending.textContent = 'Токен неверный (401) -- проверьте значение bearer-токена.';
+        pending.className = 'msg err';
+        return;
+      }
 
       if (!resp.ok) {
         const errText = await resp.text();

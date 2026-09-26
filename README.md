@@ -32,9 +32,12 @@ curl -X POST https://<ваш-деплой>.beam.cloud/v1/chat/completions \
 
 ## Вариант B — Modal.com (готов, но требует карту для A10G)
 
+Эндпоинт защищён bearer-токеном — создайте секрет **до** первого деплоя:
+
 ```bash
 pip install -r requirements.txt
 modal setup
+modal secret create qwen36-auth AUTH_TOKEN=<придумайте-свой-токен>
 modal deploy qwen_server.py
 ```
 
@@ -43,14 +46,28 @@ modal deploy qwen_server.py
 ```bash
 curl -X POST https://<ваш-юзер>--qwen36-27b-model-generate.modal.run \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <ваш-токен>" \
   -d '{"text": "Объясни разницу между MoE и dense моделями", "max_tokens": 400}'
 ```
 
 ## Чат-интерфейс
 
-`chat.html` — минималистичная веб-страница: вставьте URL вашего деплоя (Modal или Beam) в поле сверху и общайтесь с моделью из браузера. Откройте файл локально или разместите на любом статик-хостинге. Endpoint запоминается в `localStorage` браузера.
+`chat.html` — минималистичная веб-страница: вставьте URL вашего деплоя и bearer-токен в поля сверху, общайтесь с моделью из браузера. Откройте файл локально или разместите на любом статик-хостинге. Endpoint и токен запоминаются в `localStorage` браузера.
 
-Тот же чат опубликован как Claude Artifact: https://claude.ai/artifact/12s24ktGcPtgZzUECVTGuX
+Тот же чат опубликован как Claude Artifact: https://claude.ai/artifact/12s24ktGcPtgZzUECVTGuX (артефакт нужно обновить с полем токена отдельно, если пользуетесь именно им).
+
+## Бенчмарк реальной скорости
+
+`benchmark.py` — измеряет фактические TTFT (время до первого токена) и скорость генерации на уже задеплоенном сервере, вместо теоретических оценок:
+
+```bash
+pip install -r requirements-benchmark.txt
+export QWEN_ENDPOINT_URL="https://<ваш-юзер>--qwen36-27b-model-generate.modal.run"
+export QWEN_AUTH_TOKEN="<ваш-токен>"
+python3 benchmark.py --concurrency 8
+```
+
+Токен передаётся через переменные окружения, не хардкодится в файле — не коммитьте его в git.
 
 ## Применённые оптимизации (обе платформы)
 

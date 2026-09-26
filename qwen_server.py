@@ -1,6 +1,14 @@
 import modal
+from fastapi import Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 app = modal.App("qwen36-27b")
+
+# HTTPBearer() создаётся один раз на уровне модуля -- Depends(auth_scheme)
+# используется как значение по умолчанию параметра в сигнатуре эндпоинта,
+# это стандартный FastAPI dependency-injection паттерн, подтверждённый
+# официальным примером Modal для fastapi_endpoint.
+auth_scheme = HTTPBearer()
 
 # ВНИМАНИЕ: официального AWQ-кванта от команды Qwen не существует.
 # Qwen/Qwen3.6-27B-Instruct-AWQ -- несуществующий repo_id, скачивание падало бы 404.
@@ -44,6 +52,12 @@ GPU_TYPE = "A10G"
 MAX_NUM_SEQS = 48
 
 
+# Bearer-токен для защиты эндпоинта -- иначе он открыт всем, у кого есть URL.
+# Создать секрет один раз перед деплоем:
+#   modal secret create qwen36-auth AUTH_TOKEN=<ваш-произвольный-токен>
+AUTH_SECRET_NAME = "qwen36-auth"
+
+
 @app.cls(
     image=image,
     gpu=GPU_TYPE,
@@ -54,6 +68,7 @@ MAX_NUM_SEQS = 48
     # под experimental_options -- отдельного gpu_snapshot=True на верхнем
     # уровне @app.cls не появилось.
     experimental_options={"enable_gpu_snapshot": True},
+    secrets=[modal.Secret.from_name(AUTH_SECRET_NAME)],
 )
 @modal.concurrent(max_inputs=MAX_NUM_SEQS)
 class Model:
@@ -137,19 +152,33 @@ class Model:
         return {"response": text}
 
     @modal.fastapi_endpoint(method="POST")
-    async def generate(self, prompt: dict):
+    async def generate(
+        self,
+        prompt: dict,
+        token: HTTPAuthorizationCredentials = Depends(auth_scheme),
+    ):
+        from fastapi import HTTPException, status
         from fastapi.responses import StreamingResponse, JSONResponse
         from vllm import SamplingParams
         from vllm.sampling_params import RequestOutputKind
         from vllm.utils import random_uuid
         import json
+        import os
 
-        stream = prompt.get("stream", True)  # стрим по умолчанию -- это и есть "топ скорость"
         cors_headers = {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
         }
+
+        if token.credentials != os.environ["AUTH_TOKEN"]:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Неверный bearer-токен",
+                headers={"WWW-Authenticate": "Bearer", **cors_headers},
+            )
+
+        stream = prompt.get("stream", True)  # стрим по умолчанию -- это и есть "топ скорость"
 
         if not stream:
             result = await self._generate_once.local(prompt)
@@ -187,6 +216,10 @@ class Model:
 
     @modal.fastapi_endpoint(method="OPTIONS")
     def generate_options(self):
+        # Preflight-запрос браузера НЕ несёт заголовок Authorization -- это
+        # штатное поведение CORS, поэтому здесь авторизация не проверяется.
+        # Именно "Authorization" в Allow-Headers ниже разрешает браузеру
+        # отправить его на следующем реальном POST-запросе.
         from fastapi import Response
 
         return Response(
@@ -194,7 +227,7 @@ class Model:
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
             },
         )
 
